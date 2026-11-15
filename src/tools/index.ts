@@ -4,6 +4,7 @@ import type { RequestContext } from "@mastra/core/request-context";
 import { db, schema, type DbExecutor } from "../mysqlDb/index";
 import { eq, and, gte, sql } from "drizzle-orm";
 import { safeJsonParse } from "./animahub-json";
+import { isSkipPointsEnabled } from "../config/bypass";
 
 /**
  * 从 LLM 返回的文本中提取并解析 JSON 对象或数组（接入 AnimaHub 自愈修复引擎）。
@@ -135,6 +136,7 @@ export function createThrottledWriter<T>(
  * if (!ok) return error(res, '积分不足')
  */
 export async function deductPoints(userId: number, amount: number, executor: DbExecutor = db, bizType = 'consume', bizId = ''): Promise<boolean> {
+  if (isSkipPointsEnabled()) return true
   // 参数校验：必须为正数
   if (!Number.isFinite(amount) || amount <= 0) return false
 
@@ -170,6 +172,7 @@ export async function deductPoints(userId: number, amount: number, executor: DbE
  * @returns 是否成功
  */
 export async function addPoints(userId: number, amount: number, executor: DbExecutor = db, bizType = 'refund', bizId = ''): Promise<boolean> {
+  if (isSkipPointsEnabled()) return true
   if (!Number.isFinite(amount) || amount <= 0) return false
   try {
     const result: any = await executor
@@ -205,6 +208,7 @@ type PriceTier = { label?: unknown; value?: unknown; price?: unknown }
  * @param option 档位标识；缺省时只走「默认」兜底
  */
 export function resolveModelCost(model: typeof schema.ai_models.$inferSelect, option?: string): number {
+  if (isSkipPointsEnabled()) return 0
   const tiers = model.price_config
   if (!Array.isArray(tiers) || !tiers.length) return 0
   const list = tiers as PriceTier[]

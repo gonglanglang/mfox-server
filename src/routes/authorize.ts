@@ -406,12 +406,15 @@ app.post("/test-login", async (req, res) => {
 app.post("/logout", authMiddleware, async (req, res) => {
   const token = req.headers.authorization?.replace("Bearer ", "");
   if (token) {
-    // 解码拿 exp，算出剩余秒数
-    const payload = JWT.decode(token) as { exp: number };
-    const ttl = payload.exp - Math.floor(Date.now() / 1000);
-
-    if (ttl > 0) {
-      await redis.setex(`blacklist:${token}`, ttl, "1");
+    // 解码拿 exp，算出剩余秒数（免登占位 token 解码为 null 时安全跳过）
+    const payload = JWT.decode(token) as { exp?: number } | null;
+    if (payload?.exp) {
+      const ttl = payload.exp - Math.floor(Date.now() / 1000);
+      if (ttl > 0) {
+        try {
+          await redis.setex(`blacklist:${token}`, ttl, "1");
+        } catch { }
+      }
     }
   }
   return success(res, { message: "已退出" });

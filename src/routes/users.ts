@@ -4,6 +4,7 @@ import { success, error } from "../tools/response";
 import { eq, and, isNull, or } from "drizzle-orm";
 import { authMiddleware } from "../middleware/auth";
 import { DEFAULT_ASPECT_RATIO, normalizeAspectRatio } from "../config/aspect-ratios";
+import { BYPASS_DISPLAY_POINTS, isSkipPointsEnabled } from "../config/bypass";
 
 const app = express();
 
@@ -15,7 +16,13 @@ app.get("/userinfo", authMiddleware, async (_req, res) => {
     .from(schema.users)
     .where(eq(schema.users.id, userId));
   if (!rows[0]) return error(res, "未查询到用户信息");
-  return success(res, rows[0]);
+  const userRow = isSkipPointsEnabled()
+    ? {
+        ...rows[0],
+        points: Math.max(Number(rows[0].points ?? 0), BYPASS_DISPLAY_POINTS),
+      }
+    : rows[0];
+  return success(res, userRow);
 });
 
 // 更新个人信息

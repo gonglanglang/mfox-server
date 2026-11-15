@@ -4,6 +4,11 @@ import cors from "cors";
 import { MastraServer } from "@mastra/express";
 import { mastra } from "./mastra";
 import { warmupPool } from "./mysqlDb";
+import {
+  isSkipAuthEnabled,
+  isSkipPointsEnabled,
+  resolveOrCreateBypassUserId,
+} from "./config/bypass";
 
 // 路由
 import agent from "./routes/agent"; // agent配置
@@ -25,7 +30,7 @@ const PORT = process.env.PORT || 3000;
 app.use(
   cors({
     origin: "*", // 允许所有来源，生产环境换成具体域名
-    methods: ["GET", "POST", "PUT", "DELETE"],
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
     allowedHeaders: ["Content-Type", "Authorization", "aiModel"], // 设置允许的请求头
   }),
 );
@@ -40,6 +45,19 @@ app.use(/oss/, express.json({ limit: "50mb", type: "*/*" })); // 阿里云OSS上
 
 app.use(cors());
 app.use(express.json());
+
+// 免登录测试模式：为未挂载 authMiddleware 的路由（如 /pipeline）也自动注入默认测试用户上下文
+app.use(async (req, _res, next) => {
+  if (!req.user?.id && isSkipAuthEnabled()) {
+    try {
+      const bypassUserId = await resolveOrCreateBypassUserId();
+      req.user = { id: bypassUserId };
+    } catch {
+      // 数据库尚未就绪或无须用户的公开接口不阻断继续执行
+    }
+  }
+  next();
+});
 
 app.use("/agent", agent);
 app.use("/visual-styles", visualStyles);
@@ -62,6 +80,11 @@ app.listen(PORT, () => {
   console.log("\x1b[35m━━━━━━━━━━━━━━━━\x1b[0m");
   console.log("\x1b[32m🍡 Server 上线咯！\x1b[0m");
   console.log(`\x1b[96m🌐 http://localhost:${PORT}\x1b[0m`);
+  if (isSkipAuthEnabled() || isSkipPointsEnabled()) {
+    console.log(
+      `\x1b[33m⚡ [测试便捷模式] 免登/免Token=${isSkipAuthEnabled()} | 免积分计费=${isSkipPointsEnabled()}\x1b[0m`,
+    );
+  }
   console.log("\x1b[35m━━━━━━━━━━━━━━━━\x1b[0m");
 });
 

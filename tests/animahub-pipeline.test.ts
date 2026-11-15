@@ -453,3 +453,44 @@ test('AnimaHub multi-mode video assembly & pipeline contract helpers', () => {
   assert.equal(formatted.work_id, 88)
   assert.equal(formatted.cost, 25)
 })
+
+test('SKIP_AUTH & SKIP_POINTS test-mode bypass flags can be toggled cleanly', async () => {
+  const { isSkipAuthEnabled, isSkipPointsEnabled } = await import('../src/config/bypass')
+  const prevAuth = process.env.SKIP_AUTH
+  const prevPoints = process.env.SKIP_POINTS
+  const prevNodeTest = process.env.NODE_TEST_CONTEXT
+
+  try {
+    // Inside node:test with unset env vars, defaults to false to preserve billing unit tests
+    delete process.env.SKIP_AUTH
+    delete process.env.SKIP_POINTS
+    assert.equal(isSkipAuthEnabled(), false)
+    assert.equal(isSkipPointsEnabled(), false)
+
+    // Outside node:test (production / dev runtime), defaults to true temporarily for frictionless testing
+    delete process.env.NODE_TEST_CONTEXT
+    assert.equal(isSkipAuthEnabled(), true)
+    assert.equal(isSkipPointsEnabled(), true)
+
+    // Explicit false re-enables strict auth & points anytime via .env
+    process.env.SKIP_AUTH = 'false'
+    process.env.SKIP_POINTS = 'false'
+    assert.equal(isSkipAuthEnabled(), false)
+    assert.equal(isSkipPointsEnabled(), false)
+
+    // Explicit true forces bypass even inside test context
+    process.env.NODE_TEST_CONTEXT = 'child-v8'
+    process.env.SKIP_AUTH = 'true'
+    process.env.SKIP_POINTS = 'true'
+    assert.equal(isSkipAuthEnabled(), true)
+    assert.equal(isSkipPointsEnabled(), true)
+  } finally {
+    if (prevAuth === undefined) delete process.env.SKIP_AUTH
+    else process.env.SKIP_AUTH = prevAuth
+    if (prevPoints === undefined) delete process.env.SKIP_POINTS
+    else process.env.SKIP_POINTS = prevPoints
+    if (prevNodeTest === undefined) delete process.env.NODE_TEST_CONTEXT
+    else process.env.NODE_TEST_CONTEXT = prevNodeTest
+  }
+})
+
