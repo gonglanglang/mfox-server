@@ -3,52 +3,34 @@ import { createOpenAI } from "@ai-sdk/openai";
 import type { RequestContext } from "@mastra/core/request-context";
 import { db, schema, type DbExecutor } from "../mysqlDb/index";
 import { eq, and, gte, sql } from "drizzle-orm";
+import { safeJsonParse } from "./animahub-json";
 
 /**
- * 从 LLM 返回的文本中提取并解析 JSON 对象。
+ * 从 LLM 返回的文本中提取并解析 JSON 对象或数组（接入 AnimaHub 自愈修复引擎）。
  * 支持以下格式：
- * - 纯 JSON 字符串
- * - 被 ```json ... ``` 包裹的 JSON
- * - 前后包含额外说明文字的 JSON（会尝试提取最外层大括号内容）
+ * - 纯 JSON 字符串（对象或数组）
+ * - 含 `<think>...</think>` 推理块或被 ```json ... ``` 包裹的 JSON
+ * - 前后包含额外说明文字的 JSON（平衡括号提取）
+ * - 字符串内未转义换行符、漏逗号、尾随逗号自动修复
  *
  * @param text - LLM 返回的原始文本
- * @returns 解析后的对象；如果解析失败则返回 null
+ * @returns 解析后的对象/数组；如果解析失败则返回 null
  */
 export function LLMJSON(text: string): any | null {
   if (!text || typeof text !== "string") {
     return null;
   }
 
-  let cleaned = text.trim();
-
-  // 情况1：整体被 Markdown 代码块包裹，格式为 ```json ... ``` 或 ``` ... ```
-  const codeBlockMatch = cleaned.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/);
-  if (codeBlockMatch) {
-    cleaned = codeBlockMatch?.[1]?.trim() || "";
+  const parsed = safeJsonParse(text);
+  if (parsed.ok) {
+    return parsed.value;
   }
 
-  // 尝试直接解析
-  try {
-    return json5.parse(cleaned);
-  } catch (e) {
-    // 继续尝试提取大括号内容
+  // 抑制空串噪音，保留真实格式失败告警便于排障
+  if (text.trim()) {
+    console.warn("JSON 解析失败，原始文本片段：", text.slice(0, 300));
   }
-
-  // 情况2：前后有额外文字，提取第一个 { 到最后一个 } 之间的内容
-  const firstBrace = cleaned.indexOf("{");
-  const lastBrace = cleaned.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    const candidate = cleaned.slice(firstBrace, lastBrace + 1);
-    try {
-      return json5.parse(candidate);
-    } catch (e) {
-      // 解析失败，返回 null
-      console.warn("JSON 解析失败，原始文本：", text);
-      return null;
-    }
-  }
-
-  console.warn("未能从文本中提取有效 JSON，原始文本：", text);
+  void json5;
   return null;
 }
 

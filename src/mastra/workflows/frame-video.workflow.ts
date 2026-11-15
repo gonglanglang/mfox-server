@@ -1,11 +1,11 @@
 import crypto from 'node:crypto'
 import { createWorkflow, createStep } from '@mastra/core/workflows'
 import { z } from 'zod'
-import { eq, inArray, and } from 'drizzle-orm'
+import { eq, and } from 'drizzle-orm'
 import { db, schema } from '../../mysqlDb'
 import { modifyPanelInTx } from '../../mysqlDb/panel'
 import { generateTTS } from '../../tts/index'
-import { LLMJSON } from '../../tools/index'
+import { retryWithValidation, safeJsonParse } from '../../tools/animahub-json'
 import { generateVideoByModel } from '../../videoTools/generate'
 import { loadPanelPromptReferences } from '../../tools/storyboard-assets'
 import { resolveSpeakerRoleId, normalizeShotLink, sanitizeDialogueList, resolveShotMotionPrompt } from '../../tools/storyboard-text'
@@ -460,8 +460,133 @@ const FrameGeneratePanelTTS = createStep({
   },
 })
 
+export interface AnimaHubVideoContentInput {
+  genMode: string
+  firstFrameUrl?: string
+  lastFrameUrl?: string
+  prevVideoUrl?: string
+  shotSize?: string
+  cameraAngle?: string
+  cameraMovement?: string
+  motionPrompt?: string
+  keyPropAction?: string
+  soundEffect?: string
+  environment?: string
+  negativePrompt?: string
+  worldState?: string
+  characterSheet?: { name: string; url: string }[]
+  characterRefs?: { name?: string; description?: string; image_url?: string }[]
+  sceneImage?: string
+  propImages?: string[]
+}
+
+/**
+ * AnimaHub 多模态视频内容确定性组装器（支持 singleImage2video / frames2video / image2video 融图生视频 / text2video / prevVideoUrl）：
+ * - 直接复用分镜拆解阶段已推理或用户手工精修的 `motion_prompt` / `videoPrompt`，零延迟、零篡改；
+ * - 严格保持 `media` 数组顺序与提示词内 `图1`、`图2`、`视频1` 引用编号一一对应（下游 Volcengine/Seedance 自动转为 `@图像1` / `first_frame`）。
+ */
+export function buildAnimaHubVideoContent(input: AnimaHubVideoContentInput): {
+  prompt: string
+  media: { type: 'reference_image' | 'reference_video' | 'reference_audio'; url: string }[]
+} {
+  const media: { type: 'reference_image' | 'reference_video' | 'reference_audio'; url: string }[] = []
+  const imageLabels: string[] = []
+  const seenImg = new Set<string>()
+
+  const pushImg = (url: string | undefined, roleDesc: string) => {
+    const clean = String(url || '').trim()
+    if (!clean || seenImg.has(clean) || media.filter(m => m.type === 'reference_image').length >= 7) return
+    seenImg.add(clean)
+    media.push({ type: 'reference_image', url: clean })
+    const idx = media.filter(m => m.type === 'reference_image').length
+    imageLabels.push(`图${idx}${roleDesc}`)
+  }
+
+  const mode = String(input.genMode || 'singleImage2video').trim()
+  if (mode === 'text2video') {
+    // 纯文生视频不注入图片参考
+  } else if (mode === 'frames2video') {
+    pushImg(input.firstFrameUrl, '为起始首帧画面')
+    pushImg(input.lastFrameUrl, '为下一帧参考方向')
+  } else if (mode === 'image2video' || mode === 'mixed2video') {
+    if (input.firstFrameUrl) {
+      pushImg(input.firstFrameUrl, '为主构图参考画面')
+    }
+    for (const ref of input.characterRefs || []) {
+      if (ref?.image_url) {
+        pushImg(ref.image_url, `为角色「${ref.name || '角色'}」外观参考`)
+      }
+    }
+    for (const sheet of input.characterSheet || []) {
+      if (sheet?.url) {
+        pushImg(sheet.url, `为角色「${sheet.name || '角色'}」设定参考`)
+      }
+    }
+    if (input.sceneImage) {
+      pushImg(input.sceneImage, '为场景空间参考')
+    }
+    for (const propUrl of input.propImages || []) {
+      pushImg(propUrl, '为关键道具参考')
+    }
+  } else {
+    // 默认 singleImage2video
+    pushImg(input.firstFrameUrl, '为起始首帧画面')
+  }
+
+  let hasPrevVideo = false
+  if (input.prevVideoUrl && String(input.prevVideoUrl).trim()) {
+    media.push({ type: 'reference_video', url: String(input.prevVideoUrl).trim() })
+    hasPrevVideo = true
+  }
+
+  const cameraHeader = [input.shotSize, input.cameraAngle, input.cameraMovement]
+    .map(v => String(v || '').trim())
+    .filter(Boolean)
+    .join('，')
+
+  const clauses: string[] = []
+  if (imageLabels.length === 1) {
+    clauses.push(`以${imageLabels[0]}，保持人物面容、服饰与空间光影一致`)
+  } else if (imageLabels.length === 2 && mode === 'frames2video') {
+    clauses.push(`以图1为起始画面，向图2为下一帧参考方向自然连贯演进`)
+  } else if (imageLabels.length > 1) {
+    clauses.push(`多图融合参考：${imageLabels.join('，')}，严格保持角色身份与场景一致性`)
+  }
+  if (hasPrevVideo) {
+    clauses.push('参考视频1的动作惯性与镜头节奏平稳衔接')
+  }
+  if (cameraHeader) {
+    clauses.push(`镜头语言：${cameraHeader}`)
+  }
+  if (mode === 'text2video' && input.environment) {
+    clauses.push(`场景环境：${input.environment}`)
+  }
+  if (input.worldState) {
+    clauses.push(`状态保持：${input.worldState}`)
+  }
+  if (input.motionPrompt) {
+    clauses.push(`动态演进：${input.motionPrompt.replace(/[。；;]+$/, '')}`)
+  }
+  if (input.keyPropAction && !(input.motionPrompt || '').includes(input.keyPropAction)) {
+    clauses.push(`道具交互：${input.keyPropAction.replace(/[。；;]+$/, '')}`)
+  }
+  if (input.soundEffect) {
+    clauses.push(`环境音效：${input.soundEffect.replace(/[。；;]+$/, '')}`)
+  }
+  if (input.negativePrompt) {
+    clauses.push(`避免：${input.negativePrompt}`)
+  }
+
+  const rawPrompt = clauses.filter(Boolean).join('；')
+  const normalizedPrompt = sanitizeVideoPromptAvoidClause(normalizeTailFrameWording(rawPrompt))
+  return {
+    prompt: normalizedPrompt,
+    media,
+  }
+}
+
 // ============================================
-// Step 2: 生成视频提示词（AI 生成 prompt，不生成视频）
+// Step 2: 组装/推理视频多模态请求内容（AnimaHub 快速确定性路径 + LLM 自愈兜底）
 // ============================================
 const generateVideoPrompt = createStep({
   id: 'generate-video-prompt',
@@ -520,9 +645,6 @@ const generateVideoPrompt = createStep({
     }
     const panel = await modifyPanelInTx(chapterId, panelIdx, async (p) => p) as any
 
-    // 1. AI 生成视频 prompt
-    const agent: any = mastra?.getAgent('VideoPromptGeneratorOmnimodalAgent')
-    if (!agent) throw new Error('Agent VideoPromptGeneratorOmnimodalAgent 未注册')
     const {
       props: promptProps,
       scene: promptScene,
@@ -536,11 +658,6 @@ const generateVideoPrompt = createStep({
       propIds: panel.prop_ids,
     })
 
-    // 关键优化：
-    // 1. resolveStoryboardPanel 拼出的 panel.environment 含 "\n" + shot.content，只取首行纯场景环境描述；
-    // 2. 支持市场主流单帧 I2V 模式（frame_mode = 'single'）：当仅使用首帧驱动时，不传入尾帧（避免首尾两张 AI 图几何错位导致视频扭曲/动作重做）；
-    // 3. 当首帧已生成（firstFrameUrl 存在）时，首帧中已完整包含场景与角色，不再重复塞入空场景图（sceneImage）与四视图角色设定表（characterSheet）；
-    // 4. 配音统一在 Step 3 由 FFmpeg 将高清 MiniMax TTS 音频与视频环境音混音合成。
     const cleanEnvironment = String(panel.environment || '').split('\n')[0]?.trim() || ''
     const effectiveFrameMode = String(panel.frame_mode || workFrameMode || 'single')
     const effectiveGenMode = inferShotVideoMode(panel, effectiveFrameMode as any)
@@ -553,11 +670,7 @@ const generateVideoPrompt = createStep({
     const hasPrimaryKeyframe = Boolean(effectiveFirstFrameUrl)
     const hasTtsSegments = (segments || []).some(s => Boolean(s.audioUrl || s.text?.trim()))
 
-    // 若本镜有画内角色开口对白（非旁白、非内心OS）：
-    // 1. 必须剔除 motion.in 中"双唇紧闭/未开口"等只针对静态首帧的描述，改为从镜头起始即刻自然张合嘴唇做说话口型，
-    //    防止视频前半段人物闭嘴、后半段才张嘴，导致与从 0.15s 起播的 MiniMax TTS 配音时间轴错位；
-    // 2. 动作描述改为"无声口型动作"，并在 sound_effect 与 negative_prompt 中严禁视频模型自己生成人声台词，
-    //    防止视频模型胡乱脑补台词（如"王管事，求你了"）与 TTS 配音叠音打架。
+    // 画内开口角色口型同步与禁生成人声约束
     const onScreenSpeakers = (segments || [])
       .filter(s => s.type === 'dialogue' && !s.isInnerOs && s.text.trim())
       .map(s => s.roleName || '人物')
@@ -567,23 +680,14 @@ const generateVideoPrompt = createStep({
         .replace(/(?:压着嗓子|压嗓|大声|低声|冷声)?开口(?:说话)?/g, '双唇自然微张持续做说话口型')
         .trim()
 
-    const rawMotionPrompt = resolveShotMotionPrompt(panel)
+    const userVideoPrompt = typeof panel.videoPrompt === 'string' ? panel.videoPrompt.trim() : ''
+    const rawMotionPrompt = userVideoPrompt || resolveShotMotionPrompt(panel)
     const baseMotion = onScreenSpeakers.length
       ? stripClosedMouth(rawMotionPrompt)
       : rawMotionPrompt
     const enrichedMotion = onScreenSpeakers.length && baseMotion
       ? `${baseMotion.replace(/[。.]$/, '')}，${onScreenSpeakers[0]}从镜头起始双唇即自然微张持续做说话口型（仅视觉口型动作，不生成人声语音）。`
       : baseMotion
-
-    const normalizedMotion = panel.motion && typeof panel.motion === 'object'
-      ? (onScreenSpeakers.length
-        ? {
-          ...panel.motion,
-          in: `${stripClosedMouth(String(panel.motion.in || '')).replace(/[。.]$/, '')}，${onScreenSpeakers[0]}双唇微张即刻开始做说话口型。`,
-          path: `${stripClosedMouth(String(panel.motion.path || '')).replace(/[。.]$/, '')}，全程嘴唇随话语节奏持续自然开合（仅视觉口型，无对白人声）。`,
-        }
-        : panel.motion)
-      : undefined
 
     const cleanNegativePrompt = sanitizeShotNegativePrompt(
       panel.negative_prompt,
@@ -593,51 +697,112 @@ const generateVideoPrompt = createStep({
       ? `${String(panel.sound_effect || '环境音').trim()}（仅保留纯环境音效，禁止生成任何人声对白或说话声）`
       : (panel.sound_effect || '')
 
-    const promptInput = JSON.stringify({
+    const propImages = (Array.isArray(promptProps) ? promptProps : [])
+      .map((p: any) => String(p?.image || p?.url || '').trim())
+      .filter(Boolean)
+
+    const deterministicContent = buildAnimaHubVideoContent({
+      genMode: effectiveGenMode,
       firstFrameUrl: effectiveFirstFrameUrl,
       lastFrameUrl: effectiveLastFrameUrl,
-      frame_mode: effectiveFrameMode,
-      gen_mode: effectiveGenMode,
-      ...(prevVideoUrl ? { prevVideoUrl } : {}),
-      shot_size: panel.shot_size || '',
-      camera_angle: panel.camera_angle || '',
-      camera_movement: panel.camera_movement || '',
-      subject_motion: enrichedMotion,
-      motion_prompt: enrichedMotion,
-      ...(normalizedMotion ? { motion: normalizedMotion } : {}),
-      ...(panel.link ? { link: normalizeShotLink(panel) } : {}),
-      ...(panel.world_state ? { world_state: panel.world_state } : {}),
-      ...(panel.prev_shot_summary ? { prev_shot_summary: panel.prev_shot_summary } : {}),
-      key_prop_action: panel.key_prop_action || '',
-      sound_effect: effectiveSoundEffect,
-      environment: cleanEnvironment,
-      negative_prompt: cleanNegativePrompt,
-      scene: cleanEnvironment ? '' : promptScene,
-      sceneImage: hasPrimaryKeyframe ? '' : sceneImage,
-      segments: [],
-      characterSheet: hasPrimaryKeyframe ? [] : characterSheet,
-      props: promptProps || [],
+      prevVideoUrl,
+      shotSize: panel.shot_size,
+      cameraAngle: panel.camera_angle,
+      cameraMovement: panel.camera_movement,
+      motionPrompt: enrichedMotion || String(panel.content || '').trim(),
+      keyPropAction: panel.key_prop_action,
+      soundEffect: effectiveSoundEffect,
+      environment: cleanEnvironment || String(promptScene || ''),
+      negativePrompt: cleanNegativePrompt,
+      worldState: panel.world_state,
+      characterSheet,
+      characterRefs: Array.isArray(panel.character_refs) ? panel.character_refs : [],
+      sceneImage,
+      propImages,
     })
 
-    console.log('视频 prompt 输入:', promptInput)
+    let content: { prompt: string; media: { type: 'reference_image' | 'reference_video' | 'reference_audio'; url: string }[] } = deterministicContent
 
-    const result = await agent.generate(promptInput)
-    const text = result.text || ''
-    if (!text) throw new Error('视频 prompt 生成返回为空')
+    // AnimaHub 快速确定性路径：当分镜已有运动提示词或用户手工精修的 videoPrompt 时，直接采用确定性多模态组装，
+    // 省去每次单镜生成视频前 20~40 秒的冗余 LLM 等待，且避免覆盖用户手工改好的动作描述；
+    // 仅当分镜完全缺失运动描述（或显式开启 FORCE_VIDEO_PROMPT_AGENT=true）时才调用 Omnimodal Agent 补全。
+    const shouldCallAgent = process.env.FORCE_VIDEO_PROMPT_AGENT === 'true' || !rawMotionPrompt
+    if (shouldCallAgent) {
+      const agent: any = (() => {
+        try { return mastra?.getAgent('VideoPromptGeneratorOmnimodalAgent') } catch { return null }
+      })()
+      if (agent) {
+        try {
+          const normalizedMotion = panel.motion && typeof panel.motion === 'object'
+            ? (onScreenSpeakers.length
+              ? {
+                ...panel.motion,
+                in: `${stripClosedMouth(String(panel.motion.in || '')).replace(/[。.]$/, '')}，${onScreenSpeakers[0]}双唇微张即刻开始做说话口型。`,
+                path: `${stripClosedMouth(String(panel.motion.path || '')).replace(/[。.]$/, '')}，全程嘴唇随话语节奏持续自然开合（仅视觉口型，无对白人声）。`,
+              }
+              : panel.motion)
+            : undefined
 
-    const content: any = LLMJSON(text)
-    // 尾帧措辞与负面避免清单确定性清洗
-    if (content && typeof content === 'object' && typeof content.prompt === 'string') {
-      content.prompt = sanitizeVideoPromptAvoidClause(normalizeTailFrameWording(content.prompt))
-      if (prevVideoUrl && Array.isArray(content.media) && !content.media.some((m: any) => m?.type === 'reference_video' && m?.url === prevVideoUrl)) {
-        content.media.push({ type: 'reference_video', url: prevVideoUrl })
+          content = await retryWithValidation(
+            async (_attempt, lastError) => {
+              const promptInput = JSON.stringify({
+                firstFrameUrl: effectiveFirstFrameUrl,
+                lastFrameUrl: effectiveLastFrameUrl,
+                frame_mode: effectiveFrameMode,
+                gen_mode: effectiveGenMode,
+                ...(prevVideoUrl ? { prevVideoUrl } : {}),
+                shot_size: panel.shot_size || '',
+                camera_angle: panel.camera_angle || '',
+                camera_movement: panel.camera_movement || '',
+                subject_motion: enrichedMotion || String(panel.content || ''),
+                motion_prompt: enrichedMotion || String(panel.content || ''),
+                ...(normalizedMotion ? { motion: normalizedMotion } : {}),
+                ...(panel.link ? { link: normalizeShotLink(panel) } : {}),
+                ...(panel.world_state ? { world_state: panel.world_state } : {}),
+                ...(panel.prev_shot_summary ? { prev_shot_summary: panel.prev_shot_summary } : {}),
+                key_prop_action: panel.key_prop_action || '',
+                sound_effect: effectiveSoundEffect,
+                environment: cleanEnvironment,
+                negative_prompt: cleanNegativePrompt,
+                scene: cleanEnvironment ? '' : promptScene,
+                sceneImage: hasPrimaryKeyframe ? '' : sceneImage,
+                segments: [],
+                characterSheet: hasPrimaryKeyframe ? [] : characterSheet,
+                props: promptProps || [],
+                ...(lastError ? { validation_feedback: `上一轮输出 JSON 无效（${lastError}），请严格返回 {"prompt":"...","media":[...]}` } : {}),
+              })
+              const res = await agent.generate(promptInput)
+              return String(res?.text || '')
+            },
+            (rawText) => {
+              const parsed = safeJsonParse<any>(rawText, 'object')
+              if (!parsed.ok || !parsed.value || typeof parsed.value.prompt !== 'string' || !parsed.value.prompt.trim()) {
+                return { ok: false, error: parsed.ok ? '缺少有效的 prompt 字段' : parsed.error }
+              }
+              const cleanPrompt = sanitizeVideoPromptAvoidClause(normalizeTailFrameWording(parsed.value.prompt))
+              const mediaArr = Array.isArray(parsed.value.media)
+                ? parsed.value.media.filter((m: any) => m?.url && ['reference_image', 'reference_video', 'reference_audio'].includes(m?.type))
+                : deterministicContent.media.slice()
+              if (prevVideoUrl && !mediaArr.some((m: any) => m.type === 'reference_video' && m.url === prevVideoUrl)) {
+                mediaArr.push({ type: 'reference_video', url: prevVideoUrl })
+              }
+              return { ok: true, value: { prompt: cleanPrompt, media: mediaArr } }
+            },
+            { maxAttempts: 2, baseDelayMs: 300 },
+          )
+        } catch (agentErr: any) {
+          console.warn(`[frame-video] VideoPromptGeneratorOmnimodalAgent 回退确定性组装: ${agentErr?.message || agentErr}`)
+          content = deterministicContent
+        }
       }
     }
-    console.log('视频 prompt 生成结果:', content)
-    // 存储 content 到分镜对象
+
+    console.log('视频 prompt 组装结果:', content)
     await modifyPanelInTx(chapterId, panelIdx, async (p) => {
       p.videoContent = content
-      p.videoPrompt = content?.prompt || ''
+      if (!String(p.videoPrompt || '').trim()) {
+        p.videoPrompt = rawMotionPrompt || content?.prompt || ''
+      }
       p.panelStatus = 'generating'
     }) as any
 

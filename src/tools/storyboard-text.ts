@@ -280,14 +280,20 @@ const GEN_MODE_ALIASES: Record<string, VideoGenMode> = {
   singleimage2video: 'singleImage2video',
   single: 'singleImage2video',
   i2v: 'singleImage2video',
+  img2vid: 'singleImage2video',
   '图生视频': 'singleImage2video',
   '单图生视频': 'singleImage2video',
   '单帧驱动': 'singleImage2video',
   frames2video: 'frames2video',
+  frame2frame: 'frames2video',
+  firstlast: 'frames2video',
   dual: 'frames2video',
   '首尾帧': 'frames2video',
   '首尾双帧': 'frames2video',
   image2video: 'image2video',
+  fusion: 'image2video',
+  '融图': 'image2video',
+  '融图生视频': 'image2video',
   '图片参考': 'image2video',
   '多图参考': 'image2video',
   video2video: 'video2video',
@@ -328,7 +334,7 @@ export function resolveShotImagePrompt(
 }
 
 /**
- * 读取镜头运动提示词（兼容旧数据：motion_prompt ?? subject_motion）。
+ * 读取镜头运动提示词（兼容旧数据：motion_prompt ?? videoPrompt ?? subject_motion）。
  */
 export function resolveShotMotionPrompt(
   shot: Partial<TextStoryboardShot> | Record<string, any> | null | undefined,
@@ -336,6 +342,10 @@ export function resolveShotMotionPrompt(
   if (!shot) return ''
   const motionPrompt = typeof shot.motion_prompt === 'string' ? shot.motion_prompt.trim() : ''
   if (motionPrompt) return motionPrompt
+  const videoPrompt = typeof (shot as Record<string, any>).videoPrompt === 'string'
+    ? (shot as Record<string, any>).videoPrompt.trim()
+    : ''
+  if (videoPrompt) return videoPrompt
   const subj = typeof shot.subject_motion === 'string' ? shot.subject_motion.trim() : ''
   if (subj) return subj
   if (shot.motion && typeof shot.motion === 'object') {

@@ -266,10 +266,29 @@ export function applyAssetVersionToConfigs(
   if (!Array.isArray(configs) || !configs[sceneIndex] || !Array.isArray(configs[sceneIndex].shots)) {
     return { configs, videoNeedsRerun: false }
   }
-  const scene = { ...configs[sceneIndex] }
+  const scene = {
+    ...configs[sceneIndex],
+    ...(configs[sceneIndex]._frames && typeof configs[sceneIndex]._frames === 'object'
+      ? { _frames: { ...configs[sceneIndex]._frames } }
+      : {}),
+  }
   const shots = [...scene.shots]
   const shot = shots[shotIndex] ? { ...shots[shotIndex] } : null
   if (!shot) return { configs, videoNeedsRerun: false }
+
+  const upsertPoolFrame = (frameUrl: string): string => {
+    if (!scene._frames || typeof scene._frames !== 'object') {
+      scene._frames = {}
+    }
+    for (const [fid, entry] of Object.entries(scene._frames as Record<string, any>)) {
+      if (String(entry?.url || '').trim() === frameUrl) return fid
+    }
+    let idx = Object.keys(scene._frames).length + 1
+    while (scene._frames[`f${idx}`]) idx++
+    const fid = `f${idx}`
+    scene._frames[fid] = { url: frameUrl, created_at: new Date().toISOString() }
+    return fid
+  }
 
   let videoNeedsRerun = false
   const url = asset.url || ''
@@ -277,6 +296,9 @@ export function applyAssetVersionToConfigs(
     case 'first_frame':
       shot.firstFrameUrl = url
       shot.firstFrameVersion = asset.version
+      if (url && (shot.start_frame_id || scene._frames)) {
+        shot.start_frame_id = upsertPoolFrame(url)
+      }
       if (shot.videoUrl || shot.finalVideoUrl) {
         shot.videoNeedsRerun = true
         videoNeedsRerun = true
@@ -285,6 +307,9 @@ export function applyAssetVersionToConfigs(
     case 'last_frame':
       shot.lastFrameUrl = url
       shot.lastFrameVersion = asset.version
+      if (url && (shot.end_frame_id || scene._frames)) {
+        shot.end_frame_id = upsertPoolFrame(url)
+      }
       if (shot.videoUrl || shot.finalVideoUrl) {
         shot.videoNeedsRerun = true
         videoNeedsRerun = true
