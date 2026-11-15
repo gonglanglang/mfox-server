@@ -8,7 +8,7 @@ set -euo pipefail
 # - 自动拉取最新代码、安装依赖、执行类型检查、构建前端并平滑重启 PM2 / systemd 服务
 # ==============================================================================
 
-BRANCH="${GIT_BRANCH:-main}"
+BRANCH="${GIT_BRANCH:-refactor/animahub-pipeline}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_SERVER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
@@ -37,6 +37,17 @@ find_repo_dir() {
   return 1
 }
 
+sync_git_branch() {
+  local dir="$1"
+  local target_branch="$2"
+  cd "${dir}"
+  if [[ -d .git ]]; then
+    # 兼容 --single-branch 克隆，显式映射远端分支引用并强制对齐最新提交
+    git fetch origin "+refs/heads/${target_branch}:refs/remotes/origin/${target_branch}"
+    git checkout -B "${target_branch}" "origin/${target_branch}"
+  fi
+}
+
 SERVER_DIR="${SERVER_DIR:-}"
 if [[ -z "${SERVER_DIR}" ]]; then
   if [[ -f "${DEFAULT_SERVER_DIR}/src/index.ts" ]]; then
@@ -57,18 +68,13 @@ fi
 echo "=================================================="
 echo "🚀 开始部署 MFox AI 流水线重构版 (分支: ${BRANCH})"
 echo "📦 后端目录: ${SERVER_DIR}"
-echo "🌐 前端目录: ${WEB_DIR:-未检测到本地 mfox-web（跳过前端构建）}"
+echo "🌐 前端目录: ${WEB_DIR:-未检测到本地 mfox-web（若前端采用本地构建上传 dist-browser 请覆盖 Nginx 站点根目录）}"
 echo "=================================================="
 
 # 1. 更新并校验后端 mfox-server
 echo ""
 echo "👉 [1/4] 更新后端代码与依赖 (mfox-server)..."
-cd "${SERVER_DIR}"
-if [[ -d .git ]]; then
-  git fetch origin "${BRANCH}"
-  git checkout "${BRANCH}"
-  git pull --ff-only origin "${BRANCH}"
-fi
+sync_git_branch "${SERVER_DIR}" "${BRANCH}"
 
 npm install --no-audit --no-fund
 npm run typecheck
@@ -77,23 +83,30 @@ npm run typecheck
 if [[ -n "${WEB_DIR}" && -d "${WEB_DIR}" ]]; then
   echo ""
   echo "👉 [2/4] 更新并构建前端 Web 端 (mfox-web)..."
-  cd "${WEB_DIR}"
-  if [[ -d .git ]]; then
-    git fetch origin "${BRANCH}"
-    git checkout "${BRANCH}"
-    git pull --ff-only origin "${BRANCH}"
-  fi
+  sync_git_branch "${WEB_DIR}" "${BRANCH}"
   npm install --ignore-scripts --no-audit --no-fund
   npm run build:browser
 
-  # 若指定了 Nginx 静态站点目录 WEB_STATIC_DIR，则同步构建产物
+  # 若指定了 WEB_STATIC_DIR，直接覆盖；否则自动扫描常见 Nginx / 宝塔静态目录中已部署的 MFox Web 站点并同步
   if [[ -n "${WEB_STATIC_DIR:-}" && -d "${WEB_STATIC_DIR}" ]]; then
     echo "   同步 dist-browser -> ${WEB_STATIC_DIR}"
+    rm -rf "${WEB_STATIC_DIR}/assets"
     cp -rf "${WEB_DIR}/dist-browser/"* "${WEB_STATIC_DIR}/"
+  else
+    for candidate in /www/wwwroot/* /var/www/html /usr/share/nginx/html; do
+      [[ -d "${candidate}" && -f "${candidate}/index.html" ]] || continue
+      [[ "${candidate}" == "${WEB_DIR}" || "${candidate}" == "${WEB_DIR}/dist-browser" ]] && continue
+      if grep -q 'data-theme="cupcake"' "${candidate}/index.html" 2>/dev/null \
+        || compgen -G "${candidate}/assets/VideoStoryboard-*.js" >/dev/null 2>&1; then
+        echo "   自动识别到 Nginx 静态站点目录: ${candidate}，正在同步最新 dist-browser..."
+        rm -rf "${candidate}/assets"
+        cp -rf "${WEB_DIR}/dist-browser/"* "${candidate}/"
+      fi
+    done
   fi
 else
   echo ""
-  echo "👉 [2/4] 未检测到 mfox-web 目录，跳过前端构建"
+  echo "👉 [2/4] 服务器上未检测到 mfox-web 源码目录（请在本地构建 dist-browser 后上传覆盖 Nginx 静态站点目录）"
 fi
 
 # 3. 平滑重启后端进程（优先匹配 PM2 中指向 SERVER_DIR 的进程，其次匹配名称，否则自动注册）
