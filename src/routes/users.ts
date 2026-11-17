@@ -4,17 +4,31 @@ import { success, error } from "../tools/response";
 import { eq, and, isNull, or } from "drizzle-orm";
 import { authMiddleware } from "../middleware/auth";
 import { DEFAULT_ASPECT_RATIO, normalizeAspectRatio } from "../config/aspect-ratios";
-import { BYPASS_DISPLAY_POINTS, isSkipPointsEnabled } from "../config/bypass";
+import {
+  BYPASS_DISPLAY_POINTS,
+  isSkipAuthEnabled,
+  isSkipPointsEnabled,
+  resetBypassUserCache,
+  resolveOrCreateBypassUserId,
+} from "../config/bypass";
 
 const app = express();
 
 // 获取个人信息
 app.get("/userinfo", authMiddleware, async (_req, res) => {
   const userId = _req.user?.id as number;
-  const rows = await db
+  let rows = await db
     .select()
     .from(schema.users)
     .where(eq(schema.users.id, userId));
+  if (!rows[0] && isSkipAuthEnabled()) {
+    resetBypassUserCache();
+    const fallbackUserId = await resolveOrCreateBypassUserId();
+    rows = await db
+      .select()
+      .from(schema.users)
+      .where(eq(schema.users.id, fallbackUserId));
+  }
   if (!rows[0]) return error(res, "未查询到用户信息");
   const userRow = isSkipPointsEnabled()
     ? {

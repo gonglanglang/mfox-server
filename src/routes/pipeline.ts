@@ -261,7 +261,7 @@ router.post('/node/run', async (req, res) => {
       fusionExtras = await buildFusionParamsForScene({
         workId: effectiveWorkId,
         chapterId: chId,
-        userId: userId || Number(chapterRow?.user_id || 0) || undefined,
+        userId: Number(chapterRow?.user_id || 0) || userId || undefined,
         styleId,
         configs,
         sceneIndex: pos.sceneIndex,
@@ -348,7 +348,7 @@ router.post('/batch/run', async (req, res) => {
     const wId = workId ? Number(workId) : undefined
     const { row: chapterRow, configs } = await loadChapterRow(chId, wId)
     const effectiveWorkId = wId || Number(chapterRow?.work_id || 0) || undefined
-    const effectiveUserId = userId || Number(chapterRow?.user_id || 0) || undefined
+    const effectiveUserId = Number(chapterRow?.user_id || 0) || userId || undefined
     const effectiveModel = String(modelKey || model || req.headers['aimodel'] || '').trim() || undefined
 
     const rawList: any[] = Array.isArray(targets) && targets.length > 0
@@ -723,7 +723,7 @@ router.post('/prompts/infer', async (req, res) => {
         : null
 
     const effectiveWorkId = wId || Number(chapterRow.work_id || 0)
-    const effectiveUserId = userId || Number(chapterRow.user_id || 0)
+    const effectiveUserId = Number(chapterRow.user_id || 0) || userId || 0
     const styleProfile = effectiveWorkId && effectiveUserId
       ? await loadWorkStyleProfile({ workId: effectiveWorkId, userId: effectiveUserId })
       : { prompt: DEFAULT_STYLE_PROMPT, referenceUrl: '' }

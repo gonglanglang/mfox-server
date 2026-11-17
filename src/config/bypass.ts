@@ -42,6 +42,21 @@ export function resetBypassUserCache(): void {
   inflightResolve = null;
 }
 
+/** 检查指定 userId 是否仍在 users 表中存在 */
+export async function verifyUserExists(userId: number): Promise<boolean> {
+  if (!Number.isSafeInteger(userId) || userId <= 0) return false;
+  const [{ db, schema }, { eq }] = await Promise.all([
+    import("../mysqlDb"),
+    import("drizzle-orm"),
+  ]);
+  const [row] = await db
+    .select({ id: schema.users.id })
+    .from(schema.users)
+    .where(eq(schema.users.id, userId))
+    .limit(1);
+  return Boolean(row?.id);
+}
+
 /**
  * 解析或自动创建免登录测试模式绑定的真实 users.id：
  * 1. 若配置了 TEST_USER_ID 且数据库中存在该用户，优先绑定；
@@ -49,8 +64,23 @@ export function resetBypassUserCache(): void {
  * 3. 若新库 users 表为空，则自动插入一条默认测试用户记录并缓存其自增 ID。
  */
 export async function resolveOrCreateBypassUserId(): Promise<number> {
-  if (cachedBypassUserId !== null && cachedBypassUserId > 0) {
-    return cachedBypassUserId;
+  const configuredId = Number(process.env.TEST_USER_ID);
+  const currentCached = cachedBypassUserId;
+  if (
+    currentCached !== null &&
+    currentCached > 0 &&
+    (!Number.isSafeInteger(configuredId) || configuredId <= 0 || configuredId === currentCached)
+  ) {
+    try {
+      if (await verifyUserExists(currentCached)) {
+        return currentCached;
+      }
+      if (cachedBypassUserId === currentCached) {
+        cachedBypassUserId = null;
+      }
+    } catch {
+      return currentCached;
+    }
   }
   if (inflightResolve) {
     return inflightResolve;
