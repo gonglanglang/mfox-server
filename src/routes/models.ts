@@ -4,6 +4,7 @@ import { db, schema } from "../mysqlDb";
 import { success, error } from "../tools/response";
 import { checkModelCompleteness } from "../tools/model-rules";
 import { resolveCapability } from "../pipeline/model-schema";
+import { isSkipPointsEnabled } from "../config/bypass";
 
 const app = express();
 
@@ -37,6 +38,7 @@ app.get("/", async (req, res) => {
       .where(whereClause)
       .orderBy(asc(schema.ai_models.sort_order), asc(schema.ai_models.id));
 
+    const skipPoints = isSkipPointsEnabled();
     const list = joined
       .filter(({ modelRow, providerRow }) => checkModelCompleteness(modelRow, providerRow).ok)
       .map(({ modelRow, providerRow }) => ({
@@ -47,7 +49,12 @@ app.get("/", async (req, res) => {
         status: modelRow.status,
         provider_id: modelRow.provider_id,
         provider_name: providerRow.name || providerRow.provider,
-        price_config: modelRow.price_config,
+        price_config:
+          skipPoints && Array.isArray(modelRow.price_config)
+            ? modelRow.price_config.map((tier: any) =>
+                tier && typeof tier === "object" ? { ...tier, price: 0 } : tier,
+              )
+            : modelRow.price_config,
         capabilities: resolveCapability({
           key: modelRow.model,
           name: modelRow.name,

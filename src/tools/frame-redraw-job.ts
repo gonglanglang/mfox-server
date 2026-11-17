@@ -6,6 +6,7 @@ import { resolveStoryboardPanel } from './storyboard-panel'
 import { frameContinuityPlan, framePlanSnapshot } from './frame-continuity'
 import { assertFramePromptPair } from './frame-prompts'
 import { normalizeShotLink } from './storyboard-text'
+import { isSkipPointsEnabled } from '../config/bypass'
 
 /** 双帧模式下每次重绘固定出图张数：首帧 + 尾帧各一张；主流单帧模式（single）仅生成 1 张首帧。 */
 export const REDRAW_FRAME_COUNT = 2
@@ -125,7 +126,8 @@ export async function beginFrameRedraw(input: {
   /** 关键帧模式：single=主流单帧驱动（仅出1张首帧）/ dual=首尾双帧（出2张） */
   frameMode?: FrameRedrawMode
 }) {
-  if (!Number.isFinite(input.expectedCost) || input.expectedCost < 0)
+  const skipPoints = isSkipPointsEnabled()
+  if (!skipPoints && (!Number.isFinite(input.expectedCost) || input.expectedCost < 0))
     throw new Error('缺少有效的预计积分，请重新确认重绘')
   const runId = randomUUID()
   const result = await db.transaction(async tx => {
@@ -170,7 +172,7 @@ export async function beginFrameRedraw(input: {
     const imageCharge = await consumeModelPoints(input.userId, input.imageModel, 'image', input.resolution || input.quality, tx, frameCount)
     if (!imageCharge.ok) throw new Error('图片模型不可用或积分不足')
     const cost = imageCharge.cost
-    if (input.expectedCost !== cost) throw new Error('预计积分已变化，请重新确认重绘')
+    if (!skipPoints && input.expectedCost !== cost) throw new Error('预计积分已变化，请重新确认重绘')
 
     panel.panelStatus = 'generating'
     panel._task = 'redraw'

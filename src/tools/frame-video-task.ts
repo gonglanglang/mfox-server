@@ -3,6 +3,7 @@ import { db, schema, type DbExecutor } from '../mysqlDb'
 import { consumeModelPoints, addPoints } from './index'
 import { createTask } from './taskManager'
 import { resolveStoryboardPanel } from './storyboard-panel'
+import { parseGenMode } from './storyboard-text'
 
 /**
  * 进程内活跃视频任务注册表 + 遗留任务接管。
@@ -85,7 +86,21 @@ export async function createFrameVideoTask(
     const panels = Array.isArray(chapter.content_configs) ? chapter.content_configs as any[] : []
     const target = resolveStoryboardPanel(panels, panelIdx)
     const panel = target?.panel
-    if (!panel?.firstFrameUrl) throw new Error('请先生成分镜首帧')
+    if (!panel) throw new Error('分镜不存在')
+    const genMode = parseGenMode(panel.gen_mode)
+    const hasFusionRef = Boolean(
+      panel.firstFrameUrl
+      || panel.reference_frame_url
+      || (Array.isArray(panel.character_refs) && panel.character_refs.some((r: any) => Boolean(r?.image_url)))
+      || (Array.isArray(panel.custom_ref_images) && panel.custom_ref_images.length > 0),
+    )
+    if (genMode === 'text2video') {
+      // 文生视频允许无首帧直接生成
+    } else if (genMode === 'image2video' || genMode === 'mixed2video') {
+      if (!hasFusionRef) throw new Error('多图参考模式请先绑定角色/场景参考图或生成分镜首帧')
+    } else if (!panel.firstFrameUrl) {
+      throw new Error('请先生成分镜首帧')
+    }
     if (panel.panelStatus === 'generating') {
       // 先看是不是遗留（进程重启/服务发版导致没人结算）：是则接管并退款，否则按重复提交拒绝
       if (shouldTakeOverVideoTask(panel, activeVideoTasks)) {

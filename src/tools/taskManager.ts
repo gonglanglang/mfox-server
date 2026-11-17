@@ -9,6 +9,7 @@ import { EventEmitter } from "events";
 import { eq, and, desc, count } from "drizzle-orm";
 import { db, schema, type DbExecutor } from "../mysqlDb";
 import { createThrottledWriter, consumeModelPoints, addPoints } from "./index";
+import { isSkipAuthEnabled } from "../config/bypass";
 
 // ai_tasks 表的查询行类型
 type AiTaskRow = typeof schema.ai_tasks.$inferSelect;
@@ -395,7 +396,7 @@ export async function subscribeTask(
       .limit(1);
     if (!row) return res.status(404).json({ message: "任务不存在" });
 
-    if (row.userId !== userId)
+    if (!isSkipAuthEnabled() && row.userId !== userId)
       return res.status(403).json({ message: "无权访问" });
 
     if (row.status === "done") {

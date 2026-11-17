@@ -216,8 +216,10 @@ function pickDetail(detail: Record<string, unknown>, keys: string[]): string {
   return ''
 }
 
-function imageUrlOf(asset?: CardAsset | null): string {
-  return typeof asset?.image === 'string' ? asset.image.trim() : ''
+function imageUrlOf(asset?: (CardAsset & { image_url?: string }) | null): string {
+  if (typeof asset?.image === 'string' && asset.image.trim()) return asset.image.trim()
+  if (typeof asset?.image_url === 'string' && asset.image_url.trim()) return asset.image_url.trim()
+  return ''
 }
 
 /**

@@ -1,5 +1,11 @@
+import { safeJsonParse } from './animahub-json'
+
 export function parseAssetArray(raw: string): unknown[] {
-  const value = JSON.parse(raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''))
+  const parsed = safeJsonParse(String(raw ?? ''), 'array')
+  if (!parsed.ok) {
+    throw new Error(`素材 JSON 解析失败: ${parsed.error}`)
+  }
+  const value = parsed.value
   if (!Array.isArray(value)) throw new Error('素材输出必须是 JSON 数组')
   return value
 }

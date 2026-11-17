@@ -23,6 +23,7 @@ import { ScenePlannerAgent } from './agents/NovelScriptAagent/scene-planner' // 
 import { ShotBreakerAgent } from './agents/NovelScriptAagent/shot-breaker' // 单场分镜拆解专家
 import { ShotContinuityAgent } from './agents/NovelScriptAagent/shot-continuity' // 分镜连续性审查专家
 import { FramePromptRendererAgent } from './agents/NovelScriptAagent/frame-prompt-renderer' // 首尾帧提示词渲染
+import { ShotPromptInferenceAgent } from './agents/NovelScriptAagent/shot-prompt-inference' // AnimaHub 上下文与尾帧提示词推理
 // 剧本拆分工作流注册
 import { NovelScriptWorkflow } from './workflows/NovelScriptFlows/novel-script' // 初始化拆分剧本工作流
 
@@ -66,6 +67,7 @@ export const mastra = new Mastra({
     ShotContinuityAgent,
     NovelScriptAgent,
     FramePromptRendererAgent,
+    ShotPromptInferenceAgent,
 
     // ==================== 四、视频生成 ====================
     VideoPromptGeneratorOmnimodalAgent,

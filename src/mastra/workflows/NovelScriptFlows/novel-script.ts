@@ -3,12 +3,17 @@ import { z } from 'zod'
 import { RequestContext } from '@mastra/core/request-context'
 import { db, schema } from '../../../mysqlDb'
 import { eq, and } from 'drizzle-orm'
-import { parseStoryboardText, normalizeShotLink } from '../../../tools/storyboard-text'
+import { normalizeShotLink } from '../../../tools/storyboard-text'
 import { enrichChapterContinuity } from '../../../tools/shot-continuity'
 import { decideShotTransitions, syncContinuityAndTransitionsToDb } from '../../../tools/transition-decision'
 import { saveQcRecordsToDb } from '../../../tools/video-qc'
-import { loadWorkStyleProfile, buildCharacterReferences, buildSceneCard, DEFAULT_STYLE_PROMPT } from '../../../tools/storyboard-assets'
-import { LLMJSON } from '../../../tools/index'
+import { loadWorkStyleProfile } from '../../../tools/storyboard-assets'
+import { retryWithValidation, safeJsonParse } from '../../../tools/animahub-json'
+import {
+    estimateChapterStoryboardPlan,
+    parseAnimaHubStoryboardOutput,
+    synthesizeChapterContextualPrompts,
+} from '../../../tools/animahub-storyboard'
 import { enums } from '../../../routes/settings'
 import { loadStoryboardEvidence } from '../../../tools/storyboard-evidence'
 
@@ -27,7 +32,7 @@ const narrationTs = z.object({
 })
 
 // 章节剧本化：先把小说原文改写成台词完整、动作可拍的漫剧剧本，再交给分镜拆解。
-// 放在拆分之前，是为了让下游能拆出"有台词、有动作"的镜头，而不是把抽象描写拆成静立镜头。
+// 注入 AnimaHub 节奏控制指令（黄金钩子 + 推进节拍 + 悬念收束）与校验反馈重试。
 const writeChapterScriptStep = createStep({
     id: 'write-chapter-script-step',
     inputSchema: z.object({
@@ -49,28 +54,48 @@ const writeChapterScriptStep = createStep({
         const ChapterScriptWriterAgent = mastra.getAgent("ChapterScriptWriterAgent")
         if (!ChapterScriptWriterAgent) throw new Error('Agent ChapterScriptWriterAgent 未注册')
 
-        console.log('开始章节剧本化，原文长度:', inputData.text.length)
-        const stream = await ChapterScriptWriterAgent.stream(inputData.text, {
-            maxSteps: 1,
-            requestContext: inputData.requestContext,
-            onFinish: () => console.log('章节剧本化完成'),
-        })
+        const rhythmPlan = estimateChapterStoryboardPlan(inputData.text)
+        console.log(
+            `开始章节剧本化，原文长度: ${inputData.text.length}，AnimaHub 节奏规划目标镜头数: ${rhythmPlan.targetShots}（${rhythmPlan.minShots}~${rhythmPlan.maxShots}）`,
+        )
 
-        let script = ''
-        for await (const chunk of stream.textStream) {
-            process.stdout.write(chunk)
-            script += chunk
-        }
+        const script = await retryWithValidation(
+            async (attempt, lastError) => {
+                const promptInput = [
+                    inputData.text,
+                    '',
+                    rhythmPlan.rhythmDirective,
+                    ...(lastError ? [`【第 ${attempt} 次重试修正要求】：上一轮输出未通过校验（${lastError}），请输出完整、可拍摄的章节剧本正文。`] : []),
+                ].join('\n')
 
-        script = script.trim()
-        if (!script) throw new Error('章节剧本化为空，请重试')
+                const stream = await ChapterScriptWriterAgent.stream(promptInput, {
+                    maxSteps: 1,
+                    requestContext: inputData.requestContext,
+                    onFinish: () => console.log(`章节剧本化完成（第 ${attempt} 次）`),
+                })
+
+                let acc = ''
+                for await (const chunk of stream.textStream) {
+                    process.stdout.write(chunk)
+                    acc += chunk
+                }
+                return acc.trim()
+            },
+            (raw) => {
+                if (!raw || raw.length < 20) {
+                    return { ok: false, error: '章节剧本化输出为空或过短' }
+                }
+                return { ok: true, value: raw }
+            },
+            { maxAttempts: 2, baseDelayMs: 400 },
+        )
 
         console.log(`\n剧本化完成：${inputData.text.length} 字 → ${script.length} 字`)
         return { ...inputData, text: script, originalText: inputData.text }
     },
 })
 
-// 初始化拆分剧本步骤
+// 初始化拆分剧本步骤（AnimaHub 节奏引导 + JSON/标签双模自愈解析 + 错误反馈重试 + 受控并发单场拆解）
 const extractNovelScriptStep = createStep({
     id: 'extract-novel-script-step',
     inputSchema: z.object({
@@ -83,9 +108,7 @@ const extractNovelScriptStep = createStep({
     outputSchema: narrationTs,
     execute: async ({ inputData, mastra }) => {
         const scope = { workId: inputData.workId, chapterId: inputData.chapterId, userId: inputData.userId }
-        // 生成前尚无 configs，先提供当前作品/章节可选的素材。
         const { roles, props, scene } = await loadStoryboardEvidence(scope)
-        // 全局风格锚：复用作品所选画风（visual_styles）的 description + effect_image
         const styleProfile = await loadWorkStyleProfile({ workId: inputData.workId, userId: inputData.userId })
 
         const NovelScriptAgent = mastra.getAgent("NovelScriptAgent")
@@ -97,10 +120,17 @@ const extractNovelScriptStep = createStep({
             try { return mastra.getAgent("ShotBreakerAgent") } catch { return null }
         })()
 
+        const rhythmPlan = estimateChapterStoryboardPlan(inputData.text)
         const basePayload = {
             story_text: inputData.text,
-            // 提示词第 34 行约定输入键为 vocab，且为三组枚举的嵌套结构；
-            // enums 是扁平对象（含 transition），这里按契约拆出三组。
+            rhythm_plan: {
+                target_shots: rhythmPlan.targetShots,
+                min_shots: rhythmPlan.minShots,
+                max_shots: rhythmPlan.maxShots,
+                estimated_duration_sec: rhythmPlan.estimatedDurationSec,
+                split_rules: rhythmPlan.splitRules,
+                directive: rhythmPlan.rhythmDirective,
+            },
             vocab: {
                 shot_size: enums.shot_size,
                 camera_angle: enums.camera_angle,
@@ -171,77 +201,133 @@ const extractNovelScriptStep = createStep({
             }
         }
 
-        console.log("开始NovelScriptPrompt:", JSON.stringify(basePayload))
+        console.log("开始NovelScriptPrompt（含节奏规划）:", JSON.stringify({
+            targetShots: rhythmPlan.targetShots,
+            sceneCount: (scene || []).length,
+            roleCount: (roles || []).length,
+        }))
 
         let configs: any[] = []
-        let failure: Error | null = null
 
-        // 优先尝试两阶段拆解（ScenePlannerAgent 场次规划 → ShotBreakerAgent 单场分镜拆解 + 单场独立重试）
+        // 优先尝试两阶段拆解（ScenePlannerAgent 场次规划 → ShotBreakerAgent 受控并发单场分镜拆解 + 错误反馈重试）
         const useTwoStage = Boolean(ScenePlannerAgent && ShotBreakerAgent && process.env.STORYBOARD_SPLIT_MODE !== 'legacy')
         if (useTwoStage) {
             try {
-                const planPayload = JSON.stringify({
-                    story_text: inputData.text,
-                    characters: roles,
-                    scenes: scene,
-                    props,
-                })
-                const { raw: planRaw } = await streamAgentText(ScenePlannerAgent, planPayload, '场次规划（ScenePlanner）', 2)
-                const parsedPlan = LLMJSON(planRaw) as any
-                const plannedScenes: any[] = Array.isArray(parsedPlan?.scenes) ? parsedPlan.scenes : []
-                if (plannedScenes.length > 0) {
-                    const stagedConfigs: any[] = []
-                    for (let scIdx = 0; scIdx < plannedScenes.length; scIdx++) {
-                        const scenePlan = plannedScenes[scIdx]
-                        const prevScene = scIdx > 0 ? stagedConfigs[scIdx - 1] : null
-                        const prevLastShot = prevScene && Array.isArray(prevScene.shots) && prevScene.shots.length > 0
-                            ? prevScene.shots[prevScene.shots.length - 1]
-                            : null
-                        const prevSceneSummary = prevScene ? {
-                            scene_id: prevScene.scene_id,
-                            environment: prevScene.environment,
-                            last_shot_size: prevLastShot?.shot_size || '',
-                            last_camera_angle: prevLastShot?.camera_angle || '',
-                            last_axis_side: prevLastShot?.axis_side || '',
-                            last_end_state: String(prevLastShot?.motion?.out || prevLastShot?.content || '').slice(0, 120),
-                        } : null
-                        let finalScene: any = null
-                        for (let sceneAttempt = 1; sceneAttempt <= 2; sceneAttempt++) {
-                            const breakerPayload = JSON.stringify({
-                                story_text: inputData.text,
-                                scene_plan: scenePlan,
-                                style_anchor: styleProfile,
-                                ...(prevSceneSummary ? { prev_scene_summary: prevSceneSummary } : {}),
-                                vocab: basePayload.vocab,
-                                characters: roles,
-                                props,
-                                scenes: scene,
-                            })
-                            const { raw: sceneRaw } = await streamAgentText(
-                                ShotBreakerAgent,
-                                breakerPayload,
-                                `单场分镜拆解（场景 ${scIdx + 1}/${plannedScenes.length}，第 ${sceneAttempt} 次）`,
-                                5,
-                            )
-                            if (!sceneRaw) continue
-                            const parsedScenes = parseStoryboardText(sceneRaw, roles as any)
-                            if (!parsedScenes.length) continue
-                            const sc = parsedScenes[0]!
-                            if (!sc.scene_id && scenePlan.scene_id) sc.scene_id = String(scenePlan.scene_id)
-                            if (!sc.environment && scenePlan.environment) sc.environment = String(scenePlan.environment)
-                            if (!sc.transition && scenePlan.transition) sc.transition = String(scenePlan.transition)
-                            if (!sc.bgm && scenePlan.bgm) sc.bgm = String(scenePlan.bgm)
+                const plannedScenes = await retryWithValidation(
+                    async (attempt, lastError) => {
+                        const planPayload = JSON.stringify({
+                            story_text: inputData.text,
+                            rhythm_plan: basePayload.rhythm_plan,
+                            characters: roles,
+                            scenes: scene,
+                            props,
+                            ...(lastError ? { validation_feedback: `上一轮场次规划输出未通过校验：${lastError}。请严格输出合法 JSON 对象 {"scenes":[...]}` } : {}),
+                        })
+                        const { raw } = await streamAgentText(
+                            ScenePlannerAgent,
+                            planPayload,
+                            `场次规划（ScenePlanner，第 ${attempt} 次）`,
+                            2,
+                        )
+                        return raw
+                    },
+                    (raw) => {
+                        const parsed = safeJsonParse<any>(raw, 'object')
+                        if (!parsed.ok) return { ok: false, error: parsed.error }
+                        const list = Array.isArray(parsed.value?.scenes)
+                            ? parsed.value.scenes
+                            : Array.isArray(parsed.value)
+                                ? parsed.value
+                                : []
+                        if (!list.length) {
+                            return { ok: false, error: 'scenes 数组为空，至少需规划 1 个场次' }
+                        }
+                        return { ok: true, value: list }
+                    },
+                    { maxAttempts: 2, baseDelayMs: 400 },
+                )
 
-                            sanitizeScene(sc)
-                            finalScene = sc
-                            break
-                        }
-                        if (!finalScene) {
-                            throw new Error(`场景 ${scIdx + 1} 未产出可解析的分镜块`)
-                        }
-                        stagedConfigs.push(finalScene)
+                if (plannedScenes.length > 0) {
+                    const stagedConfigs: any[] = new Array(plannedScenes.length)
+                    const concurrency = Math.max(1, Math.min(2, Number(process.env.SHOT_BREAKER_CONCURRENCY || 2)))
+                    let cursor = 0
+
+                    const breakSingleScene = async (scIdx: number) => {
+                        const scenePlan = plannedScenes[scIdx]
+                        const prevPlan = scIdx > 0 ? plannedScenes[scIdx - 1] : null
+                        const prevCompleted = scIdx > 0 ? stagedConfigs[scIdx - 1] : null
+                        const prevLastShot = prevCompleted && Array.isArray(prevCompleted.shots) && prevCompleted.shots.length > 0
+                            ? prevCompleted.shots[prevCompleted.shots.length - 1]
+                            : null
+                        const prevSceneSummary = prevCompleted
+                            ? {
+                                scene_id: prevCompleted.scene_id,
+                                environment: prevCompleted.environment,
+                                last_shot_size: prevLastShot?.shot_size || '',
+                                last_camera_angle: prevLastShot?.camera_angle || '',
+                                last_axis_side: prevLastShot?.axis_side || '',
+                                last_end_state: String(prevLastShot?.motion?.out || prevLastShot?.content || '').slice(0, 120),
+                            }
+                            : prevPlan
+                                ? {
+                                    scene_id: prevPlan.scene_id || '',
+                                    environment: prevPlan.environment || prevPlan.location || '',
+                                    summary: String(prevPlan.summary || prevPlan.plot || '').slice(0, 120),
+                                }
+                                : null
+
+                        const finalScene = await retryWithValidation(
+                            async (sceneAttempt, lastError) => {
+                                const breakerPayload = JSON.stringify({
+                                    story_text: inputData.text,
+                                    scene_plan: scenePlan,
+                                    rhythm_plan: basePayload.rhythm_plan,
+                                    style_anchor: styleProfile,
+                                    ...(prevSceneSummary ? { prev_scene_summary: prevSceneSummary } : {}),
+                                    vocab: basePayload.vocab,
+                                    characters: roles,
+                                    props,
+                                    scenes: scene,
+                                    ...(lastError
+                                        ? {
+                                            validation_feedback: `上一轮输出解析失败（${lastError}）。请确保每个镜头完整包含【景别】【机位】【运镜】【画面】等必填标签！`,
+                                        }
+                                        : {}),
+                                })
+                                const { raw: sceneRaw } = await streamAgentText(
+                                    ShotBreakerAgent,
+                                    breakerPayload,
+                                    `单场分镜拆解（场景 ${scIdx + 1}/${plannedScenes.length}，第 ${sceneAttempt} 次）`,
+                                    5,
+                                )
+                                return sceneRaw
+                            },
+                            (sceneRaw) => {
+                                const parsed = parseAnimaHubStoryboardOutput(sceneRaw, roles as any)
+                                if (!parsed.ok) return parsed
+                                const sc = parsed.value[0]!
+                                if (!sc.scene_id && scenePlan.scene_id) sc.scene_id = String(scenePlan.scene_id)
+                                if (!sc.environment && scenePlan.environment) sc.environment = String(scenePlan.environment)
+                                if (!sc.transition && scenePlan.transition) sc.transition = String(scenePlan.transition)
+                                if (!sc.bgm && scenePlan.bgm) sc.bgm = String(scenePlan.bgm)
+                                sanitizeScene(sc)
+                                return { ok: true, value: sc }
+                            },
+                            { maxAttempts: 2, baseDelayMs: 400 },
+                        )
+
+                        stagedConfigs[scIdx] = finalScene
                     }
-                    if (stagedConfigs.length > 0) {
+
+                    const workers = Array.from({ length: Math.min(concurrency, plannedScenes.length) }, async () => {
+                        while (cursor < plannedScenes.length) {
+                            const idx = cursor++
+                            await breakSingleScene(idx)
+                        }
+                    })
+                    await Promise.all(workers)
+
+                    if (stagedConfigs.every(Boolean)) {
                         configs = stagedConfigs
                     }
                 }
@@ -251,40 +337,39 @@ const extractNovelScriptStep = createStep({
             }
         }
 
-        // 回退或默认单阶段拆解（NovelScriptAgent）
-        for (let attempt = 1; configs.length === 0 && attempt <= 2; attempt++) {
-            const promptText = JSON.stringify(basePayload)
-            const { raw, chunkCount } = await streamAgentText(NovelScriptAgent, promptText, '分镜拆分', 10)
-
-            if (!raw) {
-                failure = new Error('AI 返回的分镜数据为空，请重试')
-                console.warn(`[分镜拆分] 第 ${attempt} 次返回为空`)
-                continue
-            }
-
+        // 回退或默认单阶段拆解（NovelScriptAgent + 错误反馈自愈重试）
+        if (configs.length === 0) {
             try {
-                // 文本格式的核心好处：即使输出被截断，前面的场景依然完整可用，
-                // 解析器只会丢弃最后那个残块，而不是让整章白跑。
-                // 传入角色表：台词的角色归属按"说话人名字"解析
-                const parsedConfigs = parseStoryboardText(raw, roles as any)
-
-                for (let scIdx = 0; scIdx < parsedConfigs.length; scIdx++) {
-                    const sc = parsedConfigs[scIdx]
-                    sanitizeScene(sc)
-                }
-                console.log(`\n[分镜拆分] 收到 ${chunkCount} 个文本块，累计 ${raw.length} 字，解析出 ${parsedConfigs.length} 个场景`)
-                if (!parsedConfigs.length) throw new Error(`AI 未产出可解析的分镜内容（已收到 ${raw.length} 字）`)
-                configs = parsedConfigs
-                failure = null
-                break
-            } catch (error: any) {
-                failure = error
-                console.warn(`[分镜拆分] 第 ${attempt} 次解析失败：${error?.message || error}`)
+                configs = await retryWithValidation(
+                    async (attempt, lastError) => {
+                        const payloadObj = lastError
+                            ? {
+                                ...basePayload,
+                                validation_feedback: `上一轮输出未通过分镜解析校验（${lastError}）。请严格输出完整的【场景序号】与【分镜序号】块，确保每个分镜都包含【景别】【机位】【运镜】【画面】！`,
+                            }
+                            : basePayload
+                        const { raw, chunkCount } = await streamAgentText(
+                            NovelScriptAgent,
+                            JSON.stringify(payloadObj),
+                            `整章分镜拆分（第 ${attempt} 次）`,
+                            10,
+                        )
+                        console.log(`\n[分镜拆分] 收到 ${chunkCount} 个文本块，累计 ${raw.length} 字`)
+                        return raw
+                    },
+                    (raw) => {
+                        const parsed = parseAnimaHubStoryboardOutput(raw, roles as any)
+                        if (!parsed.ok) return parsed
+                        for (const sc of parsed.value) {
+                            sanitizeScene(sc)
+                        }
+                        return { ok: true, value: parsed.value }
+                    },
+                    { maxAttempts: 2, baseDelayMs: 500 },
+                )
+            } catch (err: any) {
+                throw new Error(`${err?.message || err}（已自动带反馈重试，请重跑提取分镜）`)
             }
-        }
-
-        if (failure) {
-            throw new Error(`${failure.message}（已重试一次，请重跑提取分镜）`)
         }
 
         // 生成后按 configs 引用筛选素材，统一带上描述、图片 URL 与版本 ID。
@@ -301,11 +386,11 @@ const extractNovelScriptStep = createStep({
     },
 })
 
-// 独立连贯性校验与智能转场决策节点（需求 3.2 / 4 / 5 / 6）：
+// 独立连贯性校验、{ prev, curr, next } 上下文提示词合成与智能转场决策节点：
 // 1. 删除无叙事意义的冗余切镜；
 // 2. 为所有分镜注入 subject_id / color_tone / motion_direction / prev_shot_id / next_shot_id / style_anchor_id / continuity_status 与一致性 Seed；
-// 3. 运行智能转场决策器（同场≤0.3s 软切/硬切，跨场匹配剪辑/转场，转场总时长占比上限控制）；
-// 4. 同步 storyboard、transition_decision、qc_record 三张连贯性核心表。
+// 3. 运行 AnimaHub { prev, curr, next } 滑动窗口上下文提示词合成器（自动剥离重复画风前缀、合成动态运动提示词、由首帧+运动推导差异化尾帧提示词）；
+// 4. 运行智能转场决策器并同步 storyboard、transition_decision、qc_record 三张连贯性核心表。
 export const continuityCheckStep = createStep({
     id: 'continuity-check-step',
     inputSchema: narrationTs,
@@ -316,7 +401,7 @@ export const continuityCheckStep = createStep({
             type: 'continuity-check-progress',
             stepName: 'continuity-check-step',
             status: 'continuity_checking',
-            label: '正在执行分镜连贯性校验与智能转场决策…',
+            label: '正在执行分镜连贯性校验与上下文提示词推理…',
         })
 
         const enriched = enrichChapterContinuity(configs, {
@@ -326,58 +411,11 @@ export const continuityCheckStep = createStep({
         })
         const transitions = decideShotTransitions(enriched.configs, { chapterId })
 
-        // 直接从提取的分镜字段填充 start_prompt / end_prompt / videoPrompt 与素材快照，无需再跑 GenerateFramePromptsStep
-        const stylePrompt = String(styleProfile?.prompt || '').trim() || DEFAULT_STYLE_PROMPT
-        const assetById = new Map((assets as any[]).map((a: any) => [String(a.id), a]))
-        for (const sc of enriched.configs) {
-            if (!sc || !Array.isArray(sc.shots)) continue
-            const sceneRoleIds = (Array.isArray(sc.roles) ? sc.roles : [])
-                .map((r: any) => Number(r?.id ?? r))
-                .filter(Number.isSafeInteger)
-            const sceneAsset = (assets as any[]).find((a: any) => a.type === 'scene' && String(a.id) === String(sc.scene_id))
-            const sceneCard = sceneAsset ? buildSceneCard(sceneAsset) : null
-            const sceneSnapshot = sceneCard ? {
-                scene_id: Number(sceneCard.id) || null,
-                text: sceneCard.text,
-                image_url: sceneCard.imageUrl,
-            } : null
-
-            for (const sh of sc.shots) {
-                if (!sh || typeof sh !== 'object') continue
-                const imgPrompt = String(sh.image_prompt || sh.start_prompt || sh.motion?.in || sh.content || '').trim()
-                const endPrompt = String(sh.end_prompt || sh.motion?.out || imgPrompt || '').trim()
-                const motionPrompt = String(sh.motion_prompt || sh.videoPrompt || sh.subject_motion || '').trim()
-                sh.image_prompt = imgPrompt
-                sh.start_prompt = String(sh.start_prompt || imgPrompt).trim()
-                sh.end_prompt = endPrompt
-                if (motionPrompt) {
-                    sh.motion_prompt = sh.motion_prompt || motionPrompt
-                    sh.videoPrompt = sh.videoPrompt || motionPrompt
-                }
-                sh.style_prompt_snapshot = stylePrompt
-                sh.scene_reference_snapshot = sceneSnapshot
-                const shotRoleIds = (Array.isArray(sh.roles) ? sh.roles : [])
-                    .map((r: any) => Number(r?.id ?? r))
-                    .filter(Number.isSafeInteger)
-                const charRefsSnapshot = buildCharacterReferences(
-                    [...new Set([...sceneRoleIds, ...shotRoleIds])],
-                    assets as any[],
-                )
-                sh.character_references_snapshot = charRefsSnapshot
-                if (!Array.isArray(sh.character_refs) || sh.character_refs.length === 0) {
-                    const derivedRefs = charRefsSnapshot.map(ref => {
-                        const asset = assetById.get(String(ref.role_id))
-                        return {
-                            role_id: String(ref.role_id),
-                            name: String(asset?.name || ref.role_id),
-                            description: ref.description,
-                            ...(ref.asset_url ? { image_url: ref.asset_url } : {}),
-                        }
-                    })
-                    if (derivedRefs.length > 0) sh.character_refs = derivedRefs
-                }
-            }
-        }
+        // AnimaHub { prev, curr, next } 滑动窗口上下文提示词合成与尾帧差异化推导
+        synthesizeChapterContextualPrompts(enriched.configs, {
+            assets: assets as any[],
+            styleProfile,
+        })
 
         try {
             await syncContinuityAndTransitionsToDb(chapterId, enriched.storyboardRows, transitions)
@@ -389,7 +427,7 @@ export const continuityCheckStep = createStep({
                 result: enriched.overallScore >= 80 ? 'pass' : enriched.overallScore >= 60 ? 'warn' : 'fail',
                 score: enriched.overallScore,
                 regenerate_flag: 0,
-                detail: `全章 ${enriched.storyboardRows.length} 个分镜连贯性校验完成（得分 ${enriched.overallScore}，生成 ${transitions.length} 条转场决策）`,
+                detail: `全章 ${enriched.storyboardRows.length} 个分镜连贯性校验与上下文提示词合成完成（得分 ${enriched.overallScore}，生成 ${transitions.length} 条转场决策）`,
             }])
         } catch (dbErr: any) {
             console.warn(`[continuity-check-step] 同步连贯性表失败（不影响主流程）：${dbErr?.message || dbErr}`)

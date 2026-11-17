@@ -87,6 +87,19 @@ async function loadChapterConfigsIfNeeded(chapterId: number, provided?: any[]): 
   return []
 }
 
+async function saveChapterConfigsIfNeeded(chapterId: number, configs: any[], hadInlineConfigs: boolean): Promise<void> {
+  if (hadInlineConfigs || !Array.isArray(configs) || configs.length === 0) return
+  try {
+    if (Boolean(process.env.DB_HOST && process.env.DB_NAME) && typeof (db as any)?.update === 'function') {
+      await db.update(chapters)
+        .set({ content_configs: configs, updatedAt: new Date() } as any)
+        .where(eq(chapters.id, chapterId))
+    }
+  } catch (err) {
+    console.warn(`[scheduler] 写回章节 ${chapterId} content_configs 失败:`, err)
+  }
+}
+
 function computePanelIdx(configs: any[], sceneIndex: number, shotIndex: number): number {
   let idx = 0
   for (let s = 0; s < configs.length; s++) {
@@ -120,7 +133,7 @@ export async function runNode(req: RunNodeRequest): Promise<RunNodeResult> {
         shotIndex: req.shotIndex,
         assetType: (req.assetType as any) || 'first_frame',
         shot,
-        modelKey: req.modelKey || req.params?.modelKey,
+        modelKey: req.modelKey || req.params?.modelKey || req.params?.model,
         resolution: req.params?.resolution,
         quality: req.params?.quality,
         aspectRatio: req.params?.aspectRatio,
@@ -128,6 +141,9 @@ export async function runNode(req: RunNodeRequest): Promise<RunNodeResult> {
         negativePrompt: req.params?.negativePrompt,
         stylePrompt: req.params?.stylePrompt || shot.style_prompt_snapshot,
         styleReferenceUrl: req.params?.styleReferenceUrl,
+        sceneReference: req.params?.sceneReference,
+        propReferences: req.params?.propReferences,
+        customRefImages: req.params?.customRefImages,
         generator: req.generator,
       }
       break
@@ -138,7 +154,7 @@ export async function runNode(req: RunNodeRequest): Promise<RunNodeResult> {
         shotIndex: req.shotIndex,
         panelIdx,
         shot,
-        modelKey: req.modelKey || req.params?.modelKey || 'seedance-1.5-pro',
+        modelKey: req.modelKey || req.params?.modelKey || req.params?.model || 'seedance-1.5-pro',
         mode: req.mode || req.params?.mode || shot.gen_mode,
         duration: req.params?.duration ?? shot.durShort,
         resolution: req.params?.resolution,
@@ -159,7 +175,7 @@ export async function runNode(req: RunNodeRequest): Promise<RunNodeResult> {
         voiceId: req.params?.voiceId,
         emotion: req.params?.emotion,
         tone: req.params?.tone,
-        modelKey: req.modelKey || req.params?.modelKey,
+        modelKey: req.modelKey || req.params?.modelKey || req.params?.model,
         generator: req.generator,
       }
       break
@@ -184,7 +200,7 @@ export async function runNode(req: RunNodeRequest): Promise<RunNodeResult> {
         chapterId: req.chapterId,
         sceneIndex: req.sceneIndex,
         shotIndex: req.shotIndex,
-        videoUrl: req.params?.videoUrl || shot.finalVideoUrl || shot.videoUrl,
+        videoUrl: req.params?.videoUrl || req.params?.sourceUrl || shot.finalVideoUrl || shot.videoUrl,
         targetResolution: req.params?.targetResolution || '1080p',
         aspectRatio: req.params?.aspectRatio || '16:9',
         assetType: (req.assetType as any) || 'video',
@@ -202,6 +218,7 @@ export async function runNode(req: RunNodeRequest): Promise<RunNodeResult> {
       req.shotIndex,
       output.asset,
     ).configs
+    await saveChapterConfigsIfNeeded(req.chapterId, nextConfigs, Boolean(req.configs))
   }
 
   return {
@@ -289,6 +306,10 @@ export async function runSubgraph(req: RunSubgraphRequest): Promise<RunSubgraphR
 
   const workers = Array.from({ length: Math.min(concurrency, total) }, () => worker())
   await Promise.all(workers)
+
+  if (succeeded > 0) {
+    await saveChapterConfigsIfNeeded(req.chapterId, currentConfigs, Boolean(req.configs))
+  }
 
   return {
     chapterId: req.chapterId,

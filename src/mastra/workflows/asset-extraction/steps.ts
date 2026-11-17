@@ -37,6 +37,8 @@ interface ExtractedCharacter {
   voice_id?: number | null
 }
 
+import { retryWithValidation } from '../../../tools/animahub-json'
+
 // 提取角色
 export const extractCharacters = createStep({
   id: 'extract-characters',
@@ -51,13 +53,28 @@ export const extractCharacters = createStep({
     const agent: any = mastra?.getAgent('CharacterExtractAgent')
     if (!agent) throw new Error('Agent CharacterExtractAgent 未注册')
 
-    const result = await agent.generate(`
-请从以下小说内容中提取所有角色信息，输出 JSON 数组：
+    const characters = await retryWithValidation(
+      async (_attempt, lastError) => {
+        const feedback = lastError
+          ? `\n【上一轮输出格式未通过校验，请严格修正】：${lastError}\n只输出合法 JSON 数组，不要包含未转义换行符。`
+          : ''
+        const result = await agent.generate(`
+请从以下小说内容中提取所有角色信息，输出 JSON 数组：${feedback}
 
 ${text.slice(0, 8000)}
 `, { requestContext })
-    const raw = result.text || ''
-    const characters = z.array(characterItemSchema).parse(parseAssetArray(raw))
+        return result.text || ''
+      },
+      (raw) => {
+        try {
+          const parsed = z.array(characterItemSchema).parse(parseAssetArray(raw))
+          return { ok: true, value: parsed }
+        } catch (err: any) {
+          return { ok: false, error: err?.message || '角色数组校验失败' }
+        }
+      },
+      { maxAttempts: 3, baseDelayMs: 300 },
+    )
     return { characters, text, workId, chapterId, userId, requestContext }
   },
 })
@@ -117,10 +134,14 @@ const sceneItemSchema = z.object({
   time: z.string().optional().describe('时间描述'),
   location: z.string().optional().describe('地点名称'),
   interior: z.boolean().optional().describe('室内/室外'),
-  characters: z.array(z.number().int().positive()).optional().describe('出场角色数据库 ID'),
+  characters: z.array(z.union([z.number().int().positive(), z.string()])).optional().describe('出场角色数据库 ID'),
   description: z.string().optional().describe('场景环境描写'),
   mood: z.string().optional().describe('整体情绪氛围'),
   key_events: z.string().optional().describe('关键事件或核心对话摘要'),
+})
+
+const normalizedSceneItemSchema = sceneItemSchema.extend({
+  characters: z.array(z.number().int().positive()).optional(),
 })
 
 interface ExtractedScene {
@@ -140,28 +161,57 @@ export const extractScene = createStep({
   id: 'extract-scene',
   inputSchema: coreInputSchema,
   outputSchema: coreInputSchema.extend({
-    scenes: z.array(sceneItemSchema).describe('提取到的场景信息'),
+    scenes: z.array(normalizedSceneItemSchema).describe('提取到的场景信息'),
   }),
   execute: async ({ inputData }: {
     inputData: z.infer<typeof coreInputSchema>
   }) => {
-    const { text, workId, chapterId, userId, requestContext } = inputData
+    const { text, requestContext } = inputData
     const agent: any = mastra?.getAgent('SceneExtractAgent')
     if (!agent) throw new Error('Agent SceneExtractAgent 未注册')
 
-    const result = await agent.generate(`
+    let currentAttempt = 0
+    const scenes = await retryWithValidation(
+      async (attempt, lastError) => {
+        currentAttempt = attempt
+        const feedback = lastError
+          ? `\n【上一轮输出未通过校验，请修正】：${lastError}\ncharacters 只能填写上方可用角色列表中的数字 id，禁止填写未收录路人或无效编号。`
+          : ''
+        const result = await agent.generate(`
 请从以下小说/章节内容中提取所有独立场景，输出 JSON 数组：
-可用角色（characters 只能使用这些角色的数字 id）：${JSON.stringify(inputData.roles || [])}
+可用角色（characters 只能使用这些角色的数字 id）：${JSON.stringify(inputData.roles || [])}${feedback}
 
 ${text.slice(0, 8000)}
 `, { requestContext })
-    const raw = result.text || ''
-    const scenes = z.array(sceneItemSchema).parse(parseAssetArray(raw))
-    for (const scene of scenes) {
-      const resolved = resolveCharacterIds(scene.characters || [], inputData.roles || [])
-      if (resolved.unresolved.length) throw new Error('场景引用了无效角色 ID')
-      scene.characters = resolved.ids
-    }
+        return result.text || ''
+      },
+      (raw) => {
+        try {
+          const parsed = z.array(sceneItemSchema).parse(parseAssetArray(raw))
+          const normalized: z.infer<typeof normalizedSceneItemSchema>[] = []
+          for (const scene of parsed) {
+            const rawChars = (scene.characters || []).map(v =>
+              typeof v === 'string' && /^\d+$/.test(v.trim()) ? Number(v.trim()) : v,
+            )
+            const resolved = resolveCharacterIds(rawChars, inputData.roles || [])
+            if (resolved.unresolved.length > 0 && currentAttempt < 2) {
+              return {
+                ok: false,
+                error: `场景「${scene.title || scene.location || ''}」引用了不在可用角色表中的角色 ID/名称：${JSON.stringify(resolved.unresolved)}`,
+              }
+            }
+            if (resolved.unresolved.length > 0) {
+              console.warn(`[extract-scene] 已自动过滤未收录次要角色引用: ${JSON.stringify(resolved.unresolved)}`)
+            }
+            normalized.push({ ...scene, characters: resolved.ids })
+          }
+          return { ok: true, value: normalized }
+        } catch (err: any) {
+          return { ok: false, error: err?.message || '场景数组校验失败' }
+        }
+      },
+      { maxAttempts: 3, baseDelayMs: 300 },
+    )
     return { ...inputData, scenes }
   },
 })
@@ -170,7 +220,7 @@ ${text.slice(0, 8000)}
 export const saveScenes = createStep({
   id: 'save-scenes',
   inputSchema: coreInputSchema.extend({
-    scenes: z.array(sceneItemSchema),
+    scenes: z.array(normalizedSceneItemSchema),
   }),
   outputSchema: coreInputSchema.extend({
     saved: z.number().describe('保存的场景数量'),
@@ -232,10 +282,27 @@ export const extractProps = createStep({
     const scenes = await db.select({ id: schema.personas.id, name: schema.personas.name, detail: schema.personas.detail })
       .from(schema.personas).where(and(eq(schema.personas.work_id, inputData.workId),
         eq(schema.personas.user_id, inputData.userId), eq(schema.personas.chapters_id, inputData.chapterId), eq(schema.personas.source_type, 'scene'), isNull(schema.personas.deleted_at)))
-    const result = await mastra.getAgent('PropExtractAgent').generate(
-      `角色：${JSON.stringify(inputData.roles || [])}\n场景：${JSON.stringify(scenes)}\n小说原文：\n${inputData.text.slice(0, 8000)}`,
-      { requestContext: inputData.requestContext })
-    return { ...inputData, props: z.array(propSchema).parse(parseAssetArray(result.text)) }
+    const props = await retryWithValidation(
+      async (_attempt, lastError) => {
+        const feedback = lastError
+          ? `\n【上一轮输出格式未通过校验，请修正】：${lastError}\n只输出合法 JSON 数组 [{ "name": "...", "description": "..." }]。`
+          : ''
+        const result = await mastra.getAgent('PropExtractAgent').generate(
+          `角色：${JSON.stringify(inputData.roles || [])}\n场景：${JSON.stringify(scenes)}${feedback}\n小说原文：\n${inputData.text.slice(0, 8000)}`,
+          { requestContext: inputData.requestContext },
+        )
+        return result.text || ''
+      },
+      (raw) => {
+        try {
+          return { ok: true, value: z.array(propSchema).parse(parseAssetArray(raw)) }
+        } catch (err: any) {
+          return { ok: false, error: err?.message || '道具数组校验失败' }
+        }
+      },
+      { maxAttempts: 3, baseDelayMs: 300 },
+    )
+    return { ...inputData, props }
   },
 })
 

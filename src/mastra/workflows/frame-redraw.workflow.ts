@@ -15,6 +15,7 @@ import { imageDryRunEnabled } from '../../imageTools/dry-run'
 import { normalizeShotLink } from '../../tools/storyboard-text'
 import { sanitizeShotNegativePrompt } from './NovelScriptFlows/index'
 import { recordShotAssetVersion } from '../../pipeline/shot-assets-store'
+import { stripLeadingStylePrefix } from '../../tools/animahub-json'
 export { numberFrameReferences } from '../../tools/frame-prompts'
 
 // ============================================
@@ -226,7 +227,10 @@ async function renderFrame(input: Prepared, frame: 'start' | 'end', firstFrameUr
     // 道具设定卡：本镜出现的道具的外观依据（没有道具时整段省略）
     input.propCards.length ? '【道具设定卡】\n' + input.propCards.map(card => card.text).join('\n') : '',
     worldState ? `【当前不可逆状态锁（最高优先级，覆盖场景/道具设定卡的初始静态描述）】\n${worldState}` : '',
-    frame === 'start' ? input.plan.current.start_prompt : input.plan.current.end_prompt,
+    stripLeadingStylePrefix(
+      frame === 'start' ? input.plan.current.start_prompt : input.plan.current.end_prompt,
+      input.styleProfile.prompt,
+    ),
     '禁止在画面中绘制文字、气泡、Z 字等漫画符号；不要拼图或多格分镜。',
   ].filter(Boolean).join('\n')
   // 作品级宽高比：档位（2K/3K…）要与它一起查表，才能得出供应商要的像素值，锁定出图比例
